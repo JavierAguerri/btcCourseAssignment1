@@ -10,33 +10,66 @@ import java.security.PublicKey;
 public class Transaction {
 
     public class Input {
-        /** hash of the Transaction whose output is being used */
+        /**
+         * hash of the Transaction whose output is being used
+         */
         public byte[] prevTxHash;
-        /** used output's index in the previous transaction */
+        /**
+         * used output's index in the previous transaction
+         */
         public int outputIndex;
-        /** the signature produced to check validity */
+        /**
+         * the signature produced to check validity
+         */
         public byte[] signature;
 
         public Input(byte[] prevHash, int index) {
-            if (prevHash == null)
-                prevTxHash = null;
-            else
-                prevTxHash = Arrays.copyOf(prevHash, prevHash.length);
+            if (prevHash == null) prevTxHash = null;
+            else prevTxHash = Arrays.copyOf(prevHash, prevHash.length);
             outputIndex = index;
         }
 
         public void addSignature(byte[] sig) {
-            if (sig == null)
-                signature = null;
-            else
-                signature = Arrays.copyOf(sig, sig.length);
+            if (sig == null) signature = null;
+            else signature = Arrays.copyOf(sig, sig.length);
         }
+
+        public boolean isInUTXOPool(UTXOPool utxoPool) {
+            return utxoPool.contains(new UTXO(this));
+        }
+
+        public Double claimedValue(UTXOPool utxoPool) {
+            UTXO claimedUTXO = new UTXO(this);
+            return utxoPool.getTxOutput(claimedUTXO)
+                    .map(txOutput -> txOutput.value)
+                    .orElse(null);
+        }
+
+        public PublicKey claimedAddress(UTXOPool utxoPool) {
+            UTXO claimedUTXO = new UTXO(this);
+            return utxoPool.getTxOutput(claimedUTXO)
+                    .map(txOutput -> txOutput.address)
+                    .orElse(null);
+        }
+
+        public boolean isSignatureValid(byte[] message, UTXOPool utxoPool) {
+            PublicKey pubKey = claimedAddress(utxoPool);
+            if (pubKey == null || message == null || signature == null)
+                return false;
+            else
+                return Crypto.verifySignature(pubKey, message, signature);
+        }
+
     }
 
     public class Output {
-        /** value in bitcoins of the output */
+        /**
+         * value in bitcoins of the output
+         */
         public double value;
-        /** the address or public key of the recipient */
+        /**
+         * the address or public key of the recipient
+         */
         public PublicKey address;
 
         public Output(double v, PublicKey addr) {
@@ -45,7 +78,9 @@ public class Transaction {
         }
     }
 
-    /** hash of the transaction, its unique id */
+    /**
+     * hash of the transaction, its unique id
+     */
     private byte[] hash;
     private ArrayList<Input> inputs;
     private ArrayList<Output> outputs;
@@ -59,6 +94,98 @@ public class Transaction {
         hash = tx.hash.clone();
         inputs = new ArrayList<Input>(tx.inputs);
         outputs = new ArrayList<Output>(tx.outputs);
+    }
+
+    public boolean isValid(UTXOPool utxoPool) {
+        if (getInputs() == null ||
+                getInputs().isEmpty() || // a coinbase tx might have no inputs though
+                getOutputs() == null ||
+                getOutputs().isEmpty() ||
+                getHash() == null
+        ) return false;
+        for (Input in : getInputs()) {
+            if (in == null) return false;
+            if (in.prevTxHash == null) return false;
+            if (in.signature == null) return false;
+        }
+        for (Output out : getOutputs()) {
+            if (out == null) return false;
+            if (out.address == null) return false;
+        }
+        if (areClaimedUTXOsMissingInPool(utxoPool) ||
+                areInvalidInputSignatures(utxoPool) ||
+                areDuplicateUTXOclaims() ||
+                areNegativeUTXOclaims(utxoPool) ||
+                isSumInputsLTsumOutputs(utxoPool)
+        ) return false;
+        // check txHash is what is supposed to be
+        byte[] actualTxHash = getHash().clone();
+        finish();
+        byte[] expectedHash = getHash();
+        return (Arrays.equals(actualTxHash, expectedHash));
+    }
+
+    private boolean areClaimedUTXOsMissingInPool(UTXOPool utxoPool) {
+        for (Input in : getInputs()) {
+            if (!in.isInUTXOPool(utxoPool))
+                return true;
+        }
+        return false;
+    }
+
+    private boolean areInvalidInputSignatures(UTXOPool utxoPool) {
+        int index = 0;
+        for (Input in : getInputs()) {
+            if (!in.isSignatureValid(getRawDataToSign(index++), utxoPool))
+                return true;
+        }
+        return false;
+    }
+
+    private boolean areDuplicateUTXOclaims() {
+        UTXOPool claimedUTXOPool = new UTXOPool();
+        for (Input in : inputs) {
+            if (claimedUTXOPool.contains(new UTXO(in))) {
+                return true;
+            } else
+                claimedUTXOPool.addUTXO(new UTXO(in), null);
+        }
+        return false;
+    }
+
+    private boolean areNegativeUTXOclaims(UTXOPool utxoPool) {
+        for (Input in : inputs) {
+            Double claimedValue = in.claimedValue(utxoPool);
+            if (claimedValue == null) return true;
+            if (claimedValue < 0) return true;
+        }
+        return false;
+    }
+
+    private boolean isSumInputsLTsumOutputs(UTXOPool utxoPool) {
+        Double sumInputs = sumInputs(utxoPool);
+        double sumOutputs = sumOutputs();
+        if (sumInputs == null) return true;
+        return sumInputs < sumOutputs;
+    }
+
+
+    private Double sumInputs(UTXOPool utxoPool) {
+        double sum = 0;
+        for (Input in : inputs) {
+            Double claimedValue = in.claimedValue(utxoPool);
+            if (claimedValue == null) return null;
+            sum += claimedValue;
+        }
+        return sum;
+    }
+
+    private double sumOutputs() {
+        double sum = 0;
+        for (Output op : outputs) {
+            sum += op.value;
+        }
+        return sum;
     }
 
     public void addInput(byte[] prevTxHash, int outputIndex) {
@@ -89,16 +216,14 @@ public class Transaction {
     public byte[] getRawDataToSign(int index) {
         // ith input and all outputs
         ArrayList<Byte> sigData = new ArrayList<Byte>();
-        if (index > inputs.size())
-            return null;
+        if (index > inputs.size()) return null;
         Input in = inputs.get(index);
         byte[] prevTxHash = in.prevTxHash;
         ByteBuffer b = ByteBuffer.allocate(Integer.SIZE / 8);
         b.putInt(in.outputIndex);
         byte[] outputIndex = b.array();
-        if (prevTxHash != null)
-            for (int i = 0; i < prevTxHash.length; i++)
-                sigData.add(prevTxHash[i]);
+        if (prevTxHash != null) for (int i = 0; i < prevTxHash.length; i++)
+            sigData.add(prevTxHash[i]);
         for (int i = 0; i < outputIndex.length; i++)
             sigData.add(outputIndex[i]);
         for (Output op : outputs) {
@@ -131,14 +256,12 @@ public class Transaction {
             b.putInt(in.outputIndex);
             byte[] outputIndex = b.array();
             byte[] signature = in.signature;
-            if (prevTxHash != null)
-                for (int i = 0; i < prevTxHash.length; i++)
-                    rawTx.add(prevTxHash[i]);
+            if (prevTxHash != null) for (int i = 0; i < prevTxHash.length; i++)
+                rawTx.add(prevTxHash[i]);
             for (int i = 0; i < outputIndex.length; i++)
                 rawTx.add(outputIndex[i]);
-            if (signature != null)
-                for (int i = 0; i < signature.length; i++)
-                    rawTx.add(signature[i]);
+            if (signature != null) for (int i = 0; i < signature.length; i++)
+                rawTx.add(signature[i]);
         }
         for (Output op : outputs) {
             ByteBuffer b = ByteBuffer.allocate(Double.SIZE / 8);
@@ -160,7 +283,7 @@ public class Transaction {
         return tx;
     }
 
-    public void finalize() {
+    public void finish() {
         try {
             MessageDigest md = MessageDigest.getInstance("SHA-256");
             md.update(getRawTx());
